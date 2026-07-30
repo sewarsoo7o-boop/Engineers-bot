@@ -1,0 +1,498 @@
+import os
+import re
+import json
+import telebot
+from telebot import types
+
+# ---------------- الإعدادات ----------------
+BOT_TOKEN = '8838936553:AAEQ-BlbFMyO8GwiFRB6RJdAk2_cv1X_ZzE'
+ADMIN_CHAT_ID = '6596940817'
+CHANNEL_USERNAME = '@UOB_Engineers'
+
+bot = telebot.TeleBot(BOT_TOKEN)
+
+# ---------------- جداول الدرجات والتقديرات ----------------
+GRADE_POINTS = {'AA': 4.0, 'A': 3.5, 'BB': 3.0, 'B': 2.5, 'CC': 2.0, 'C': 1.5, 'DD': 1.0, 'D': 0.5, 'F': 0.0}
+GRADE_ORDER = ['F', 'D', 'DD', 'C', 'CC', 'B', 'BB', 'A', 'AA']
+IGNORED_GRADES = ['I', 'S', 'U']
+GRADE_DESC = {'A': 'ممتاز', 'B': 'جيد جداً', 'C': 'جيد', 'D': 'مقبول', 'F': 'راسب أو ضعيف'}
+GRADE_EMOJI = {'AA': '💎', 'A': '🏅', 'BB': '🥈', 'B': '🥉', 'CC': '⭐', 'C': '📘', 'DD': '📙', 'D': '📕', 'F': '❌'}
+
+MAIN_KEYBOARD = types.ReplyKeyboardMarkup(resize_keyboard=True)
+MAIN_KEYBOARD.row('📊 معدلي الحالي', '🧮 حاسبة المعدل')
+MAIN_KEYBOARD.row('🎯 كم أحتاج لهدف معين', '🔄 أثر تحسين مادة')
+MAIN_KEYBOARD.row('🏆 ما تقديري؟', '⚖️ موازنة مواد فصلي')
+MAIN_KEYBOARD.row('💾 سجل معدلاتي', '💬 صارحني')
+MAIN_KEYBOARD.row('❓ كيف أستخدم البوت')
+
+# ---------------- إدارة البيانات والملفات المحلية ----------------
+USER_STATES = {}
+USER_DATA = {}
+BANNED_USERS = set()
+ALL_USERS = set()
+MAINTENANCE_MODE = False
+
+HISTORY_FILE = 'uob_engineers_gpa_history.json'
+SARAKHNI_FILE = 'uob_engineers_sarakhni_log.json'
+
+def load_json(filename, default):
+    if os.path.exists(filename):
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return default
+    return default
+
+def save_json(filename, data):
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def normalize_digits(s):
+    digit_map = {'٠':'0','١':'1','٢':'2','٣':'3','٤':'4','٥':'5','٦':'6','٧':'7','٨':'8','٩':'9','،':','}
+    for k, v in digit_map.items():
+        s = s.replace(k, v)
+    return s
+
+def check_subscription(user_id):
+    try:
+        member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        return member.status in ['member', 'administrator', 'creator']
+    except Exception:
+        return True
+
+def is_admin(user_id):
+    return str(user_id) == str(ADMIN_CHAT_ID)
+
+# ---------------- المعالجات الرئيسية للرسائل ----------------
+@bot.message_handler(commands=['start'])
+def handle_start(message):
+    chat_id = message.chat.id
+    ALL_USERS.add(str(chat_id))
+    
+    if str(chat_id) in BANNED_USERS:
+        bot.send_message(chat_id, '🚫 تم حظرك من استخدام البوت.')
+        return
+
+    if not check_subscription(chat_id):
+        send_sub_prompt(chat_id)
+        return
+
+    args = message.text.split()
+    if len(args) > 1 and args[1] == 'sarakhni':
+        USER_STATES[chat_id] = 'sarakhni'
+        bot.send_message(chat_id,
+            '💬 صارحني\n\nهنا يمكنك إرسال أي شيء بكل حرية:\nسؤال، اقتراح، ملاحظة، أو أي شيء تريده\n'
+            '━━━━━━━━━━━━━━━━━━━━\n📌 اعلم أن:\n• رسالتك ستصل مباشرة للإدارة\n• قد تُنشر بشكل مجهول\n'
+            '• يمكن للإدارة الرد عليك مباشرة\n━━━━━━━━━━━━━━━━━━━━\n\nاكتب رسالتك الآن 👇\n\nللإلغاء أرسل: إلغاء')
+        return
+
+    USER_STATES[chat_id] = 'idle'
+    bot.send_message(chat_id,
+        '🎓 أهلاً بك في UOB Engineers\nمنصتك لمتابعة معدلك بكلية الهندسة - جامعة بنغازي 🏛️\n\n✨ بالتوفيق في مسيرتك!',
+        reply_markup=MAIN_KEYBOARD)
+
+def send_sub_prompt(chat_id):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton('✅ اشتركت', callback_data='check_sub'))
+    bot.send_message(chat_id,
+        f'⚠️ يجب الاشتراك في القناة أولاً\n\nاشترك في قناتنا لتتمكن من استخدام البوت:\n👉 {CHANNEL_USERNAME}\n\nبعد الاشتراك اضغط الزر بالأسفل:',
+        reply_markup=markup)
+
+@bot.message_handler(func=lambda msg: True)
+def handle_all_messages(message):
+    chat_id = message.chat.id
+    text = (message.text or '').strip()
+    ALL_USERS.add(str(chat_id))
+
+    if str(chat_id) in BANNED_USERS:
+        bot.send_message(chat_id, '🚫 تم حظرك من استخدام البوت.')
+        return
+
+    if MAINTENANCE_MODE and not is_admin(chat_id):
+        bot.send_message(chat_id, '🛠️ البوت متوقف مؤقتاً للصيانة، حاول لاحقاً 🙏')
+        return
+
+    if not check_subscription(chat_id):
+        send_sub_prompt(chat_id)
+        return
+
+    if text == 'إلغاء':
+        USER_STATES[chat_id] = 'idle'
+        bot.send_message(chat_id, '✅ تم الإلغاء. اختر من القائمة 👇', reply_markup=MAIN_KEYBOARD)
+        return
+
+    if text == '📊 معدلي الحالي':
+        bot.send_message(chat_id,
+            '📊 معدلي الحالي\n\n⚠️ هذه الميزة متوقفة مؤقتاً\nسيتم إعادة تفعيلها قريباً\n\n'
+            'في هذه الأثناء، استخدم:\n🧮 حاسبة المعدل (احسب بنفسك بدقة)\n\nبالتوفيق! ✨')
+        return
+    elif text == '🧮 حاسبة المعدل':
+        USER_STATES[chat_id] = 'manual_calc'
+        bot.send_message(chat_id,
+            '🧮 حاسبة المعدل\n\nأرسل موادك بهذا الشكل:\nعدد الوحدات ثم الدرجة، كل مادة في سطر\n'
+            '━━━━━━━━━━━━━━━━━━━━\nمثال:\n12 BB\n9 CC\n6 AA\n3 A\n━━━━━━━━━━━━━━━━━━━━\n\n'
+            '📌 ملاحظات:\n• استخدم آخر درجة حصلت عليها\n• مواد فصل واحد = معدل فصلي\n• كل مواد دراستك = المعدل التراكمي\n'
+            '• مواد I أو S أو U تُتجاهل تلقائياً\n\nللإلغاء أرسل: إلغاء')
+        return
+    elif text == '🎯 كم أحتاج لهدف معين':
+        USER_STATES[chat_id] = 'what_if'
+        bot.send_message(chat_id,
+            '🎯 كم أحتاج لهدف معين؟\n\nأرسل 4 أرقام كل رقم في سطر:\n━━━━━━━━━━━━━━━━━━━━\n'
+            '1️⃣ معدلك التراكمي الحالي\n2️⃣ وحداتك المنجزة حتى الآن\n3️⃣ وحداتك المتبقية\n4️⃣ المعدل الذي تطمح إليه\n'
+            '━━━━━━━━━━━━━━━━━━━━\nمثال:\n2.80\n60\n30\n3.20\n━━━━━━━━━━━━━━━━━━━━\n\nللإلغاء أرسل: إلغاء')
+        return
+    elif text == '🔄 أثر تحسين مادة':
+        USER_STATES[chat_id] = 'improve'
+        bot.send_message(chat_id,
+            '🔄 أثر تحسين مادة على معدلك\n\nأرسل 5 أسطر:\n━━━━━━━━━━━━━━━━━━━━\n'
+            '1️⃣ معدلك التراكمي الحالي\n2️⃣ مجموع وحداتك الكلية\n3️⃣ وحدات المادة التي تريد تحسينها\n'
+            '4️⃣ درجتها القديمة\n5️⃣ درجتها الجديدة المتوقعة\n━━━━━━━━━━━━━━━━━━━━\nمثال:\n2.80\n90\n12\nCC\nBB\n'
+            '━━━━━━━━━━━━━━━━━━━━\n\nللإلغاء أرسل: إلغاء')
+        return
+    elif text == '🏆 ما تقديري؟':
+        USER_STATES[chat_id] = 'my_grade'
+        bot.send_message(chat_id, '🏆 ما تقديري؟\n\nأرسل معدلك فقط\n\nمثال: 3.20\n\nللإلغاء أرسل: إلغاء')
+        return
+    elif text == '⚖️ موازنة مواد فصلي':
+        USER_STATES[chat_id] = 'balance'
+        bot.send_message(chat_id,
+            '⚖️ موازنة مواد فصلي\n\nأرسل مواد فصلك مع توقعاتك:\nعدد الوحدات ثم الدرجة المتوقعة، كل مادة في سطر\n'
+            '━━━━━━━━━━━━━━━━━━━━\nمثال:\n12 BB\n9 AA\n6 CC\n3 B\n━━━━━━━━━━━━━━━━━━━━\n\n'
+            'هذه الميزة تساعدك على:\n• معرفة معدلك المتوقع هذا الفصل\n• اكتشاف أي مادة تستحق جهداً أكبر\n\nللإلغاء أرسل: إلغاء')
+        return
+    elif text == '💾 سجل معدلاتي':
+        show_history(chat_id)
+        return
+    elif text == '💬 صارحني':
+        USER_STATES[chat_id] = 'sarakhni'
+        bot.send_message(chat_id,
+            '💬 صارحني\n\nهنا يمكنك إرسال أي شيء بكل حرية:\nسؤال، اقتراح، ملاحظة، أو أي شيء تريده\n'
+            '━━━━━━━━━━━━━━━━━━━━\n📌 اعلم أن:\n• رسالتك ستصل مباشرة للإدارة\n• قد تُنشر بشكل مجهول\n'
+            '• يمكن للإدارة الرد عليك مباشرة\n━━━━━━━━━━━━━━━━━━━━\n\nاكتب رسالتك الآن 👇\n\nللإلغاء أرسل: إلغاء')
+        return
+    elif text == '❓ كيف أستخدم البوت':
+        show_help(chat_id)
+        return
+
+    if is_admin(chat_id) and text.startswith('/رد_'):
+        handle_admin_reply(chat_id, text)
+        return
+
+    state = USER_STATES.get(chat_id, 'idle')
+    if state == 'manual_calc':
+        handle_manual_calc(chat_id, text, is_balance=False)
+    elif state == 'balance':
+        handle_manual_calc(chat_id, text, is_balance=True)
+    elif state == 'what_if':
+        handle_what_if(chat_id, text)
+    elif state == 'improve':
+        handle_improve(chat_id, text)
+    elif state == 'my_grade':
+        handle_my_grade(chat_id, text)
+    elif state == 'sarakhni':
+        handle_sarakhni(chat_id, text, message)
+    else:
+        bot.send_message(chat_id, '👇 اختر من الأزرار بالأسفل', reply_markup=MAIN_KEYBOARD)
+
+# ---------------- منطق الدوال والتحليلات ----------------
+def rating_label(gpa):
+    best_g = 'F'
+    best_diff = float('inf')
+    for g, p in GRADE_POINTS.items():
+        diff = abs(p - gpa)
+        if diff < best_diff:
+            best_diff = diff
+            best_g = g
+    base = best_g[0]
+    doubled = len(best_g) == 2
+    return f"{GRADE_EMOJI[best_g]} {GRADE_DESC[base]}{' مرتفع' if doubled else ''} ({best_g})"
+
+def handle_manual_calc(chat_id, text, is_balance):
+    lines = [s.strip() for s in text.split('\n') if s.strip()]
+    details, ignored, errors = [], [], []
+    total_units, total_points = 0.0, 0.0
+
+    for line in lines:
+        norm = normalize_digits(line)
+        m = re.match(r'^(\d+(?:\.\d+)?)\s*([A-Za-z]{1,2})$', norm)
+        if not m:
+            errors.append(line)
+            continue
+        units = float(m.group(1))
+        grade = m.group(2).upper()
+        if grade in IGNORED_GRADES:
+            ignored.append(f"{units} {grade}")
+            continue
+        if grade not in GRADE_POINTS:
+            errors.append(line)
+            continue
+        pts = GRADE_POINTS[grade]
+        details.append({'units': units, 'grade': grade, 'points': pts})
+        total_units += units
+        total_points += units * pts
+
+    if not details:
+        bot.send_message(chat_id, '⚠️ لم أتمكن من حساب أي مادة صالحة.\nتأكد من الصيغة وأعد المحاولة.\n\nللإلغاء أرسل: إلغاء')
+        return
+
+    gpa = total_points / total_units if total_units > 0 else 0
+    rating = rating_label(gpa)
+
+    out = '⚖️ تحليل مواد فصلك\n' if is_balance else '✅ نتيجة الحساب\n'
+    out += '━━━━━━━━━━━━━━━━━━━━\n📋 تفاصيل المواد:\n'
+    for d in details:
+        out += f"• {d['units']} وحدة × {d['grade']} ({d['points']}) = {d['units']*d['points']:.1f}\n"
+    out += '━━━━━━━━━━━━━━━━━━━━\n'
+    if ignored:
+        out += f"ℹ️ تم تجاهل: {', '.join(ignored)} (لا تحتسب في المعدل)\n"
+    out += f"📐 مجموع الوحدات: {total_units}\n📊 مجموع النقاط: {total_points:.1f}\n"
+    out += f"🎯 معدلك المتوقع هذا الفصل: {gpa:.2f}\n" if is_balance else f"🎯 معدلك: {gpa:.2f}\n"
+    out += f"🏆 التقدير: {rating}\n━━━━━━━━━━━━━━━━━━━━"
+
+    bot.send_message(chat_id, out)
+    
+    USER_DATA[f"{chat_id}_pending_gpa"] = f"{gpa:.2f}"
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton('✅ نعم', callback_data='save_yes'),
+        types.InlineKeyboardButton('❌ لا', callback_data='save_no')
+    )
+    bot.send_message(chat_id, '💾 هل تريد حفظ هذا المعدل؟', reply_markup=markup)
+
+def handle_what_if(chat_id, text):
+    lines = [normalize_digits(s.strip()) for s in text.split('\n') if s.strip()]
+    if len(lines) != 4:
+        bot.send_message(chat_id, '⚠️ أرسل 4 أرقام فقط، كل رقم في سطر.\nمثال:\n2.80\n60\n30\n3.20')
+        return
+    try:
+        current, completed, remaining, target = map(float, lines)
+    except ValueError:
+        bot.send_message(chat_id, '⚠️ أرقام غير صحيحة، أعد المحاولة.')
+        return
+
+    if remaining <= 0:
+        bot.send_message(chat_id, '⚠️ الوحدات المتبقية يجب أن تكون أكبر من صفر.')
+        return
+
+    needed = (target * (completed + remaining) - current * completed) / remaining
+
+    if needed > 4.0:
+        out = f"⚠️ الهدف بعيد هذه المرة\n\nحتى لو حصلت على 4.0 في كل وحداتك المتبقية\nلن تتمكن من الوصول لمعدل {target:.2f}"
+    elif needed <= 0:
+        out = "🎉 أنت تجاوزت هدفك بالفعل!\n\nمعدلك الحالي يكفي للوصول إلى الهدف"
+    else:
+        out = f"📊 نتيجة الحساب\n\nمعدلك الحالي: {current:.2f} ({completed} وحدة)\nهدفك: {target:.2f}\nالوحدات المتبقية: {remaining}\n━━━━━━━━━━━━━━━━━━━━\n📌 تحتاج معدل {needed:.2f} في وحداتك المتبقية\nللوصول إلى هدفك 💪"
+
+    bot.send_message(chat_id, out)
+    USER_STATES[chat_id] = 'idle'
+
+def handle_improve(chat_id, text):
+    lines = [normalize_digits(s.strip()) for s in text.split('\n') if s.strip()]
+    if len(lines) != 5:
+        bot.send_message(chat_id, '⚠️ أرسل 5 أسطر بالضبط.\nمثال:\n2.80\n90\n12\nCC\nBB')
+        return
+    try:
+        current = float(lines[0])
+        total_units = float(lines[1])
+        subj_units = float(lines[2])
+        old_grade = lines[3].upper()
+        new_grade = lines[4].upper()
+    except ValueError:
+        bot.send_message(chat_id, '⚠️ خطأ في البيانات المدخلة.')
+        return
+
+    if old_grade not in GRADE_POINTS or new_grade not in GRADE_POINTS or total_units <= 0:
+        bot.send_message(chat_id, '⚠️ تأكد من الدرجات (مثل CC، BB) والوحدات.')
+        return
+
+    old_total_pts = current * total_units
+    new_total_pts = old_total_pts - (subj_units * GRADE_POINTS[old_grade]) + (subj_units * GRADE_POINTS[new_grade])
+    new_gpa = new_total_pts / total_units
+    diff = new_gpa - current
+
+    out = f"🔄 نتيجة تحسين المادة\n\nالمادة: {subj_units} وحدة | {old_grade} ← {new_grade}\n━━━━━━━━━━━━━━━━━━━━\n📉 معدلك قبل التحسين: {current:.2f}\n📈 معدلك بعد التحسين: {new_gpa:.2f}\n✨ الفرق: {'+' if diff>=0 else ''}{diff:.2f}\n━━━━━━━━━━━━━━━━━━━━"
+    bot.send_message(chat_id, out)
+    USER_STATES[chat_id] = 'idle'
+
+def handle_my_grade(chat_id, text):
+    try:
+        gpa = float(normalize_digits(text.strip()))
+    except ValueError:
+        bot.send_message(chat_id, '⚠️ أرسل رقم معدل صحيح بين 0.00 و 4.00')
+        return
+
+    if not (0 <= gpa <= 4.0):
+        bot.send_message(chat_id, '⚠️ الرقم خارج النطاق الصحيح (0-4).')
+        return
+
+    rating = rating_label(gpa)
+    out = (f"🏆 تقديرك الأكاديمي\n\nمعدلك: {gpa:.2f}\n━━━━━━━━━━━━━━━━━━━━\n{rating}\n"
+           "━━━━━━━━━━━━━━━━━━━━\n\n📊 جدول تفصيل الدرجات الرسمي:\n"
+           "💎 من 90 إلى 100  →  AA  (المعامل 4)\n"
+           "🏅 من 85 إلى اقل من 90  →  A  (المعامل 3.5)\n"
+           "🥈 من 80 إلى اقل من 85  →  BB  (المعامل 3)\n"
+           "🥉 من 75 إلى اقل من 80  →  B  (المعامل 2.5)\n"
+           "⭐ من 70 إلى اقل من 75  →  CC  (المعامل 2)\n"
+           "📘 من 65 إلى اقل من 70  →  C  (المعامل 1.5)\n"
+           "📙 من 60 إلى اقل من 65  →  DD  (المعامل 1)\n"
+           "📕 من 50 إلى اقل من 60  →  D  (المعامل 0.5)\n"
+           "❌ اقل من 50  →  F  (المعامل 0)\n"
+           "ℹ️ غير مكمل ← I    |    مرضي ← S    |    غير مرضي ← U")
+    bot.send_message(chat_id, out)
+    USER_STATES[chat_id] = 'idle'
+
+def handle_sarakhni(chat_id, text, msg):
+    sarakhni_data = load_json(SARAKHNI_FILE, {"count": 0, "users": {}, "messages": []})
+    user_str = str(chat_id)
+    
+    if user_str not in sarakhni_data["users"]:
+        sarakhni_data["count"] += 1
+        sarakhni_data["users"][user_str] = str(1000 + sarakhni_data["count"])
+        
+    anon_id = sarakhni_data["users"][user_str]
+    
+    user_info = msg.from_user
+    username = f"@{user_info.username}" if user_info.username else "بدون يوزر"
+    full_name = f"{user_info.first_name or ''} {user_info.last_name or ''}".strip()
+    identity_line = f"{username}  |  {full_name}  |  ID: {chat_id}"
+
+    sarakhni_data["messages"].append({
+        "anonId": anon_id,
+        "text": text,
+        "identity": identity_line
+    })
+    save_json(SARAKHNI_FILE, sarakhni_data)
+
+    USER_STATES[chat_id] = 'idle'
+    bot.send_message(chat_id,
+        f"✅ وصلت رسالتك بنجاح\n\n🔢 رقمك المجهول: #{anon_id}\n\nهذا الرقم ثابت ليك بكل رسائلك الجاية\nقد نردّ عليك هنا مباشرة 🙏",
+        reply_markup=MAIN_KEYBOARD)
+
+    bot.send_message(ADMIN_CHAT_ID,
+        f"😍 لديك صراحة من مجهول {anon_id}\n💬 صارحني UOB Engineers\n\n{text}\n\n👤 (لعلمك فقط): {identity_line}\n\n↩️ للرد: /رد_{anon_id} نص الرد")
+
+def handle_admin_reply(chat_id, text):
+    m = re.match(r'^\/رد_(\d+)\s+(.+)$', text, re.DOTALL)
+    if not m:
+        bot.send_message(chat_id, '⚠️ الصيغة الخاطئة. استخدم: /رد_1001 نص الرد')
+        return
+    anon_id = m.group(1)
+    reply_text = m.group(2)
+
+    sarakhni_data = load_json(SARAKHNI_FILE, {"users": {}})
+    target_chat_id = None
+    for u_id, a_id in sarakhni_data["users"].items():
+        if a_id == anon_id:
+            target_chat_id = u_id
+            break
+
+    if not target_chat_id:
+        bot.send_message(chat_id, f"⚠️ لم يتم العثور على صاحب الرقم #{anon_id}")
+        return
+
+    try:
+        bot.send_message(target_chat_id, f"📩 رد من الإدارة على رسالتك (مجهول #{anon_id}):\n\n{reply_text}")
+        bot.send_message(chat_id, '✅ تم إرسال الرد.')
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ فشل إرسال الرد: {e}")
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callbacks(call):
+    chat_id = call.message.chat.id
+    data = call.data
+
+    if data == 'check_sub':
+        if check_subscription(chat_id):
+            bot.answer_callback_query(call.id, '✅ شكراً لاشتراكك!')
+            bot.send_message(chat_id, '🎓 أهلاً بك في البوت!', reply_markup=MAIN_KEYBOARD)
+        else:
+            bot.answer_callback_query(call.id, '⚠️ لم تشترك في القناة بعد!', show_alert=True)
+            
+    elif data == 'save_no':
+        bot.answer_callback_query(call.id)
+        bot.send_message(chat_id, 'تمام، ما راح يتحفظ 👍', reply_markup=MAIN_KEYBOARD)
+        
+    elif data == 'save_yes':
+        bot.answer_callback_query(call.id)
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton('تراكمي', callback_data='save_type_cum'),
+            types.InlineKeyboardButton('فصلي', callback_data='save_type_sem')
+        )
+        bot.send_message(chat_id, '📌 اختر نوع المعدل:', reply_markup=markup)
+        
+    elif data in ['save_type_cum', 'save_type_sem']:
+        bot.answer_callback_query(call.id)
+        gpa = float(USER_DATA.get(f"{chat_id}_pending_gpa", 0))
+        history = load_json(HISTORY_FILE, {})
+        user_str = str(chat_id)
+        if user_str not in history:
+            history[user_str] = []
+
+        if data == 'save_type_cum':
+            history[user_str].append({'semester': 'تراكمي', 'type': 'تراكمي', 'gpa': gpa})
+            bot.send_message(chat_id, '✅ تم حفظ معدلك التراكمي بنجاح! يمكنك مراجعته من "💾 سجل معدلاتي"', reply_markup=MAIN_KEYBOARD)
+        else:
+            sem_count = sum(1 for r in history[user_str] if r['type'] == 'فصلي') + 1
+            label = f"فصلي {sem_count}"
+            history[user_str].append({'semester': label, 'type': 'فصلي', 'gpa': gpa})
+            bot.send_message(chat_id, f'✅ تم حفظ معدلك ({label}) بنجاح!', reply_markup=MAIN_KEYBOARD)
+            
+        save_json(HISTORY_FILE, history)
+
+def show_history(chat_id):
+    history = load_json(HISTORY_FILE, {})
+    records = history.get(str(chat_id), [])
+    if not records:
+        bot.send_message(chat_id, '💾 سجل معدلاتك فارغ حالياً.\nاحسب معدلك من "🧮 حاسبة المعدل" ثم احفظه!')
+        return
+
+    out = '💾 سجل معدلاتك\n━━━━━━━━━━━━━━━━━━━━\n📈 تاريخ معدلاتك:\n\n'
+    max_gpa, max_sem, last_cum = 0, records[0]['semester'], None
+    
+    for i, r in enumerate(records):
+        trend = ''
+        if i > 0:
+            trend = ' ↑' if r['gpa'] > records[i-1]['gpa'] else (' ↓' if r['gpa'] < records[i-1]['gpa'] else '')
+        out += f"📘 {r['semester']}  →  {r['gpa']:.2f}{trend} ({r['type']})\n"
+        if r['gpa'] > max_gpa:
+            max_gpa = r['gpa']
+            max_sem = r['semester']
+        if r['type'] == 'تراكمي':
+            last_cum = r['gpa']
+
+    out += '━━━━━━━━━━━━━━━━━━━━\n'
+    if last_cum is not None:
+        out += f"📊 آخر تراكمي محفوظ: {last_cum:.2f}\n"
+    out += f"🌟 أعلى فصل: {max_sem} ({max_gpa:.2f})\n━━━━━━━━━━━━━━━━━━━━\n\n🏆 إنجازاتك:\n"
+    best = max(r['gpa'] for r in records)
+    out += f"🥉 تجاوزت 2.50  {'✅' if best >= 2.50 else '❌'}\n"
+    out += f"🥈 تجاوزت 3.00  {'✅' if best >= 3.00 else '❌'}\n"
+    out += f"🥇 تجاوزت 3.50  {'✅' if best >= 3.50 else '❌'}\n"
+    out += f"💎 وصلت 4.00    {'✅' if best >= 4.00 else '❌'}"
+
+    bot.send_message(chat_id, out)
+
+def show_help(chat_id):
+    text = ('❓ دليل الاستخدام\n━━━━━━━━━━━━━━━━━━━━\n'
+            '🧮 حاسبة المعدل\nأرسل موادك ووحداتها لحساب معدلك\n\n'
+            '🎯 كم أحتاج لهدف\nاعرف المعدل المطلوب في وحداتك المتبقية\n\n'
+            '🔄 أثر تحسين مادة\nشوف كيف تؤثر مادة معينة على معدلك\n\n'
+            '🏆 ما تقديري\nاعرف تقديرك الأكاديمي\n\n'
+            '⚖️ موازنة الفصل\nخطط لمواد فصلك واعرف أين تركز جهدك\n\n'
+            '💾 سجل معدلاتي\nاحفظ معدلاتك وتابع تطورك\n\n'
+            '💬 صارحني\nأرسل رأيك أو سؤالك للإدارة بكل حرية\n━━━━━━━━━━━━━━━━━━━━')
+    bot.send_message(chat_id, text)
+
+# ---------------- تشغيل البوت المستمر ----------------
+print("🧹 جاري إزالة الربط القديم وتجهيز الاتصال...")
+try:
+    bot.delete_webhook()  # السطر السحري لإلغاء التعارض تلقائياً!
+except Exception as e:
+    pass
+
+print("🚀 البوت يعمل الان بنجاح...")
+bot.infinity_polling()
+
+da
